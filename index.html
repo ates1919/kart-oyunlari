@@ -153,6 +153,8 @@
     #deckVisualStack { width: 100%; height: 100%; }
     .deck-count-badge { position: absolute; bottom: -8px; right: -8px; background: var(--gold); color: #111; font-weight: 800; font-size: 0.72rem; padding: 2px 7px; border-radius: 999px; box-shadow: 0 2px 6px rgba(0,0,0,0.5); white-space: nowrap; }
     .center-play-zone { position: relative; min-width: calc(var(--card-w) * 2.3); min-height: calc(var(--card-h) * 1.25); display: flex; align-items: center; justify-content: center; }
+    .pile-card-wrap.drop-in svg { animation: cardDrop .28s cubic-bezier(.2,.8,.2,1); }
+    @keyframes cardDrop { from { opacity: 0; transform: translateY(-26px) scale(1.18); } to { opacity: 1; transform: none; } }
     .pile-card-wrap { position: absolute; width: var(--card-w); height: var(--card-h); transition: transform .25s ease; }
 
     .table-overlay-controls { position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%); background: rgba(9,13,22,0.95); border: 1px solid var(--gold);
@@ -941,7 +943,7 @@
       getView(state, viewerId) {
         return {
           gameId: 'batak', phase: state.phase, trump: state.trump, highestBid: state.highestBid, turnPlayerId: state.players[state.turnIndex]?.id || null,
-          highestBidderId: state.highestBidderId,
+          highestBidderId: state.highestBidderId, bids: state.bids,
           // DÜZELTME: koz henüz seçilmeden göstergede "♠ Koz" yazıyordu.
           deckCount: state.phase === 'BIDDING' ? `İhale: ${state.highestBid > 4 ? state.highestBid : '—'}`
             : state.phase === 'CHOOSE_TRUMP' ? `İhale: ${state.highestBid} • Koz seçiliyor`
@@ -966,9 +968,23 @@
           hand.forEach((c) => counts[c.suit]++);
           return { type: 'SELECT_TRUMP', suit: Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0] };
         }
+        // İYİLEŞTİRME: Bot eskiden hep en büyük kartını atıyordu. Artık eli alabiliyorsa alır, alamıyorsa en küçük kartını verir.
         const cards = legal.map((m) => hand.find((c) => c.id === m.cardId)).filter(Boolean);
-        cards.sort((a, b) => RANK_POW[b.rank] - RANK_POW[a.rank]);
-        return { type: 'PLAY_CARD', cardId: cards[0].id };
+        const trump = state.trump, pow = (c) => RANK_POW[c.rank];
+        const lowest = (arr) => [...arr].sort((a, b) => ((a.suit === trump) - (b.suit === trump)) || pow(a) - pow(b))[0];
+        let pick;
+        if (state.trick.length === 0) {
+          pick = cards.find((c) => c.rank === 'A' && c.suit !== trump) || lowest(cards);
+        } else {
+          const beats = (c, best) => (c.suit === best.suit ? pow(c) > pow(best) : c.suit === trump);
+          let best = state.trick[0].card;
+          for (const t of state.trick.slice(1)) if (beats(t.card, best)) best = t.card;
+          const winners = cards.filter((c) => beats(c, best));
+          if (!winners.length) pick = lowest(cards);
+          else if (state.trick.length === 3) pick = lowest(winners);
+          else pick = [...winners].sort((a, b) => ((a.suit === trump) - (b.suit === trump)) || pow(b) - pow(a))[0];
+        }
+        return { type: 'PLAY_CARD', cardId: (pick || cards[0]).id };
       }
     };
 
@@ -987,14 +1003,26 @@
           lastEvent: { type: 'PASS', text: 'Solunuzdaki oyuncuya paslamak için 3 kart seçin!' }
         };
       },
+      cardTotal(s) {
+        return Object.values(s.hands).reduce((a, h) => a + h.length, 0) + s.trick.length + s.trickCount * 4
+          + (s.phase === 'PASSING' ? Object.values(s.passedSelections).reduce((a, h) => a + h.length, 0) : 0);
+      },
       checkEnd(s) { const t = Object.values(s.penalties).reduce((a, b) => a + b, 0); if (t !== 26 && t !== 78) throw new Error(`Hearts toplam ceza ${t} (26 veya 78 olmalı)`); },
+
+      // İYİLEŞTİRME: Paslaşma artık eş zamanlı. Herkes aynı anda 3 kartını seçer (eskiden oyuncular sırayla bekliyordu).
+      actors(state) {
+        if (state.over || state.resolving) return [];
+        if (state.phase === 'PASSING') return state.players.filter((p) => !state.passedSelections[p.id]).map((p) => p.id);
+        const cur = state.players[state.turnIndex];
+        return cur ? [cur.id] : [];
+      },
 
       getLegalMoves(state, playerId) {
         if (state.over || state.resolving) return [];
+        const hand = state.hands[playerId] || [];
+        if (state.phase === 'PASSING') return state.passedSelections[playerId] ? [] : cardMoves(hand, 'PASS_SELECT');
         const cur = state.players[state.turnIndex];
         if (!cur || cur.id !== playerId) return [];
-        const hand = state.hands[playerId] || [];
-        if (state.phase === 'PASSING') return cardMoves(hand, 'PASS_CARD');
         if (state.trickCount === 0 && state.trick.length === 0) {
           const club2 = hand.find((c) => c.suit === 'C' && c.rank === '2');
           if (club2) return [{ type: 'PLAY_CARD', cardId: club2.id }];
@@ -1035,23 +1063,22 @@
           next.lastEvent = { type: pts > 0 ? 'CAPTURE' : 'PLAY', text: pts > 0 ? `${next.players[next.turnIndex].name} ${pts} ceza puanı aldı!` : 'Temiz el!' };
           return { state: next, valid: true };
         }
-        const legal = this.getLegalMoves(state, playerId);
-        if (!legal.some((m) => m.type === move.type && m.cardId === move.cardId)) return { state, valid: false, reason: 'Kural dışı kart seçimi.' };
-        const hand = next.hands[playerId];
-        const [card] = hand.splice(hand.findIndex((c) => c.id === move.cardId), 1);
 
         if (next.phase === 'PASSING') {
-          (next.passedSelections[playerId] = next.passedSelections[playerId] || []).push(card);
-          if (next.passedSelections[playerId].length < 3) {
-            next.lastEvent = { type: 'PASS', text: `${3 - next.passedSelections[playerId].length} kart daha seçin.` };
-            return { state: next, valid: true };
-          }
-          if (Object.keys(next.passedSelections).length < 4 || Object.values(next.passedSelections).some((a) => a.length < 3)) {
-            next.turnIndex = (next.turnIndex + 1) % 4;
-            next.lastEvent = { type: 'PASS', text: `${next.players[next.turnIndex].name} paslayacak kartlarını seçiyor.` };
+          const bad = (reason) => ({ state, valid: false, reason });
+          if (move.type !== 'PASS_CARDS') return bad('Önce paslayacağınız 3 kartı seçin.');
+          if (next.passedSelections[playerId]) return bad('Kartlarınızı zaten pasladınız.');
+          const hand = next.hands[playerId] || [];
+          const ids = Array.isArray(move.cardIds) ? [...new Set(move.cardIds)] : [];
+          if (ids.length !== 3 || !ids.every((id) => typeof id === 'string' && hand.some((c) => c.id === id))) return bad('Tam olarak 3 kart seçmelisiniz.');
+          next.passedSelections[playerId] = ids.map((id) => hand.splice(hand.findIndex((c) => c.id === id), 1)[0]);
+          const waiting = next.players.filter((p) => !next.passedSelections[p.id]);
+          if (waiting.length > 0) {
+            next.lastEvent = { type: 'PASS', text: `Paslaşma: ${4 - waiting.length}/4 oyuncu hazır. Bekleniyor...` };
             return { state: next, valid: true };
           }
           for (let i = 0; i < 4; i++) next.hands[next.players[(i + 1) % 4].id].push(...next.passedSelections[next.players[i].id]);
+          next.passedSelections = {};
           next.phase = 'PLAYING';
           next.turnIndex = next.players.findIndex((p) => next.hands[p.id].some((c) => c.suit === 'C' && c.rank === '2'));
           if (next.turnIndex === -1) next.turnIndex = 0;
@@ -1059,6 +1086,10 @@
           return { state: next, valid: true };
         }
 
+        const legal = this.getLegalMoves(state, playerId);
+        if (move.type !== 'PLAY_CARD' || !legal.some((m) => m.cardId === move.cardId)) return { state, valid: false, reason: 'Kural dışı kart seçimi.' };
+        const hand = next.hands[playerId];
+        const [card] = hand.splice(hand.findIndex((c) => c.id === move.cardId), 1);
         if (card.suit === 'H') next.heartsBroken = true;
         next.trick.push({ playerId, card });
         if (next.trick.length === 4) { next.resolving = true; next.fastResolve = false; }
@@ -1071,11 +1102,14 @@
           statusText: `${state.penalties[p.id] || 0} Ceza Puanı`, total: -(state.penalties[p.id] || 0) })).sort((a, b) => b.total - a.total);
       },
       getView(state, viewerId) {
+        const passing = state.phase === 'PASSING' && !state.over;
+        const pending = this.actors(state);
         return {
-          gameId: 'hearts', phase: state.phase, turnPlayerId: state.players[state.turnIndex]?.id || null,
-          deckCount: state.heartsBroken ? '♥ Kırıldı' : '♥ Kapalı', over: state.over, resolving: state.resolving, lastEvent: state.lastEvent,
+          gameId: 'hearts', phase: state.phase, passDone: Boolean(state.passedSelections[viewerId]),
+          turnPlayerId: passing ? (pending.includes(viewerId) ? viewerId : (pending[0] || null)) : (state.players[state.turnIndex]?.id || null),
+          deckCount: passing ? 'Paslaşma' : state.heartsBroken ? '♥ Kırıldı' : '♥ Kapalı', over: state.over, resolving: state.resolving, lastEvent: state.lastEvent,
           tablePile: state.trick.map((t) => ({ id: t.card.id, suit: t.card.suit, rank: t.card.rank, hidden: false })),
-          players: state.players.map((p) => ({ ...pubPlayer(p), cardCount: (state.hands[p.id] || []).length, score: state.penalties[p.id] || 0 })),
+          players: state.players.map((p) => ({ ...pubPlayer(p), cardCount: (state.hands[p.id] || []).length, score: state.penalties[p.id] || 0, passed: passing ? Boolean(state.passedSelections[p.id]) : undefined })),
           myHand: state.hands[viewerId] || [], legalMoves: this.getLegalMoves(state, viewerId), scoreboard: state.over ? this.getScores(state) : null
         };
       },
@@ -1086,7 +1120,7 @@
         const hand = state.hands[botId] || [];
         const cards = legal.map((m) => ({ m, c: hand.find((x) => x.id === m.cardId) })).filter((x) => x.c);
         const danger = (c) => (c.suit === 'S' && c.rank === 'Q' ? 100 : c.suit === 'H' ? 20 + RANK_POW[c.rank] : (c.suit === 'S' && ['K', 'A'].includes(c.rank)) ? 50 : RANK_POW[c.rank]);
-        if (state.phase === 'PASSING') return cards.sort((a, b) => danger(b.c) - danger(a.c))[0].m;
+        if (state.phase === 'PASSING') return { type: 'PASS_CARDS', cardIds: cards.sort((a, b) => danger(b.c) - danger(a.c)).slice(0, 3).map((x) => x.c.id) };
         const leadSuit = state.trick[0]?.card.suit;
         const dump = leadSuit && !cards.some((x) => x.c.suit === leadSuit); // renk yok: en tehlikeli kartı at
         if (dump) return cards.sort((a, b) => danger(b.c) - danger(a.c))[0].m;
@@ -1321,12 +1355,15 @@
       },
       cardTotal(s) { return Object.values(s.hands).reduce((a, h) => a + h.length, 0) + s.warPot.length; },
       checkEnd(s) { if (this.cardTotal(s) !== 52) throw new Error('Savaş sonu kart sayısı 52 değil'); },
+      actors(state) {
+        if (state.over || state.resolving) return [];
+        return state.players.filter((p) => !state.readyFlips[p.id] && (state.hands[p.id] || []).length > 0).map((p) => p.id);
+      },
 
       getLegalMoves(state, playerId) {
         if (state.over || state.resolving) return [];
-        const cur = state.players[state.turnIndex];
-        if (!cur || cur.id !== playerId) return [];
-        if ((state.hands[playerId] || []).length === 0) return [];
+        // İYİLEŞTİRME: İki oyuncu da sıra beklemeden kartını açabilir.
+        if ((state.hands[playerId] || []).length === 0 || state.readyFlips[playerId]) return [];
         return [{ type: 'FLIP_CARD' }];
       },
       applyMove(state, playerId, move) {
@@ -1342,7 +1379,7 @@
         if (move.type !== 'FLIP_CARD' || !this.getLegalMoves(state, playerId).length) return { state, valid: false, reason: 'Sıra sizde değil.' };
         next.readyFlips[playerId] = true;
         if (!next.readyFlips[p0] || !next.readyFlips[p1]) {
-          next.turnIndex = next.turnIndex === 0 ? 1 : 0;
+          next.turnIndex = next.readyFlips[p0] ? 1 : 0;
           next.lastEvent = { type: 'PLAY', text: 'Rakibin kart açması bekleniyor...' };
           return { state: next, valid: true };
         }
@@ -1384,8 +1421,9 @@
         if (state.lastBattle?.p0Card) pile.push({ ...state.lastBattle.p0Card, hidden: false });
         if (state.lastBattle?.p1Card) pile.push({ ...state.lastBattle.p1Card, hidden: false });
         const my = state.hands[viewerId] || [];
+        const pending = this.actors(state);
         return {
-          gameId: 'savas', turnPlayerId: state.players[state.turnIndex]?.id || null, deckCount: `Tur: ${state.round}/60`, over: state.over,
+          gameId: 'savas', turnPlayerId: pending.includes(viewerId) ? viewerId : (pending[0] || state.players[state.turnIndex]?.id || null), deckCount: `Tur: ${state.round}/60`, over: state.over,
           resolving: state.resolving, lastEvent: state.lastEvent, tablePile: pile,
           players: state.players.map((p) => ({ ...pubPlayer(p), cardCount: (state.hands[p.id] || []).length, score: (state.hands[p.id] || []).length })),
           myHand: my.length > 0 ? [{ id: 'top_war_card', hidden: true }] : [], legalMoves: this.getLegalMoves(state, viewerId), scoreboard: state.over ? this.getScores(state) : null
@@ -1424,8 +1462,8 @@
         let pid, move;
         if (state.resolving) { pid = 'system'; move = { type: 'RESOLVE' }; }
         else {
-          pid = state.players[state.turnIndex].id;
-          move = mod.botMove(state, pid);
+          pid = mod.actors ? mod.actors(state)[0] : state.players[state.turnIndex].id;
+          move = pid ? mod.botMove(state, pid) : null;
           if (!move) throw new Error(`${mod.name}: Bot hamle üretemedi!`);
         }
         const res = applyGuarded(mod, state, pid, move);
@@ -1819,6 +1857,27 @@
         this.players = []; this.authState = null; this.lastView = null; this.resolveTimer = null;
         this.inGame = false; this.viewSeq = 0; this.evSeq = 0; this.botCounter = 0; this.emojiLast = new Map();
         this.idleTimer = null; this.idleMs = Number(window.KVIP_IDLE_MS) || 60000;
+        this.wins = new Map(); this.tallied = false;
+      }
+
+      // Şu anda hamle yapması beklenen oyuncular (Maça Kızı paslaşması ve Savaş'ta birden fazla olabilir).
+      _actors(st) {
+        const mod = GAME_MAP[st.gameId];
+        if (st.over || st.resolving) return [];
+        if (mod.actors) return mod.actors(st);
+        const tp = st.players[st.turnIndex];
+        return tp ? [tp.id] : [];
+      }
+
+      // Oturum boyunca galibiyet sayacı (aynı odada üst üste oynanan oyunlar için).
+      _tally() {
+        const st = this.authState;
+        if (!st || !st.over || this.tallied) return;
+        this.tallied = true;
+        const scores = GAME_MAP[st.gameId].getScores(st);
+        if (!scores.length) return;
+        const top = scores[0].total;
+        for (const row of scores) if (row.total === top) this.wins.set(row.playerId, (this.wins.get(row.playerId) || 0) + 1);
       }
 
       _clearTimers() {
@@ -1834,13 +1893,13 @@
         if (!this.isHost || !st || st.over || st.resolving) return;
         if (!this.net.roomCode || this.net.roomCode === 'SOLO') return;
         if (this.players.filter((p) => !p.isBot).length < 2) return;
-        const tp = st.players[st.turnIndex];
-        if (!tp || tp.isBot) return;
+        const tp = this._actors(st).map((id) => st.players.find((p) => p.id === id)).find((p) => p && !p.isBot);
+        if (!tp) return;
         const pid = tp.id, seq = this.viewSeq, mod = GAME_MAP[st.gameId];
         this.idleTimer = setTimeout(() => {
           this.idleTimer = null;
           const cur = this.authState;
-          if (!cur || cur.resolving || cur.over || this.viewSeq !== seq || cur.players[cur.turnIndex]?.id !== pid) return;
+          if (!cur || cur.resolving || cur.over || this.viewSeq !== seq || !this._actors(cur).includes(pid)) return;
           const move = mod.botMove(cur, pid);
           if (!move) return;
           const msg = `⏱ ${tp.name} ${Math.round(this.idleMs / 1000)} sn hamle yapmadı, otomatik oynandı.`;
@@ -1851,7 +1910,7 @@
 
       // DÜZELTME: Eskiden odaya katılan istemcide engine.isHost=true kalıyordu; hamleler host'a gönderilmiyordu (istemci hiç oynayamıyordu).
       setClientMode() { this._clearTimers(); this.players = []; this.authState = null; this.lastView = null; this.inGame = false; this.isHost = false; }
-      reset() { this._clearTimers(); this.players = []; this.authState = null; this.lastView = null; this.inGame = false; this.isHost = true; }
+      reset() { this._clearTimers(); this.players = []; this.authState = null; this.lastView = null; this.inGame = false; this.isHost = true; this.wins = new Map(); this.tallied = false; }
 
       initSoloOrHostLobby(localProfile, selectedGameId = 'pisti') {
         this.reset();
@@ -1957,6 +2016,7 @@
         this.gameOptions.noTrumpFirstLead = chk ? chk.checked : true;
         this.inGame = true;
         this.authState = mod.init(this.players, this.gameOptions);
+        this.tallied = false; this._tally();
         this.evSeq++;
         this._broadcastViews();
         this._checkAndTriggerBotTurn();
@@ -1983,6 +2043,7 @@
         // Olay sayacı: aynı olay (ör. Pişti) RESOLVE sonrasında tekrar yayınlandığında ses/efekt ikinci kez çalmasın.
         if (move.type !== 'RESOLVE' || JSON.stringify(result.state.lastEvent) !== JSON.stringify(this.authState.lastEvent)) this.evSeq++;
         this.authState = result.state;
+        this._tally();
         this._broadcastViews();
         if (this.authState.resolving) {
           if (this.resolveTimer) clearTimeout(this.resolveTimer);
@@ -2008,14 +2069,14 @@
         const mod = GAME_MAP[this.authState.gameId];
         this._armIdle();
         if (mod.isOver(this.authState) || this.authState.resolving) { this.botCtrl.clear(); return; }
-        const tp = this.authState.players[this.authState.turnIndex];
-        if (!tp || !tp.isBot) { this.botCtrl.clear(); return; }
+        const tp = this._actors(this.authState).map((id) => this.authState.players.find((p) => p.id === id)).find((p) => p && p.isBot);
+        if (!tp) { this.botCtrl.clear(); return; }
         const botId = tp.id;
         this.botCtrl.schedule(() => {
           const st = this.authState;
           if (!st || st.resolving || mod.isOver(st)) return;
-          const cur = st.players[st.turnIndex];
-          if (!cur || cur.id !== botId || !cur.isBot) return;
+          const cur = st.players.find((p) => p.id === botId);
+          if (!cur || !cur.isBot || !this._actors(st).includes(botId)) return;
           const move = mod.botMove(st, botId);
           if (move) this.handlePlayerMove(botId, move);
         });
@@ -2024,7 +2085,7 @@
       _syncLobby() {
         const lobbyState = {
           selectedGameId: this.selectedGameId,
-          players: this.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isHost: p.isHost, connected: p.connected }))
+          players: this.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar, isBot: p.isBot, isHost: p.isHost, connected: p.connected, wins: this.wins.get(p.id) || 0 }))
         };
         if (this.inGame) return; // oyun sürerken lobi ekranı masanın üstüne açılmaz
         if (this.isHost) this.net.broadcastFromHost('LOBBY_STATE', lobbyState);
@@ -2039,6 +2100,7 @@
           if (p.isBot) continue;
           const view = mod.getView(this.authState, p.id);
           view._seq = this.viewSeq; view._ev = this.evSeq;
+          if (view.over) view.sessionWins = this.players.map((x) => ({ name: x.name, avatar: x.avatar, wins: this.wins.get(x.id) || 0 }));
           if (p.id === this.net.localPlayerId) { this.lastView = view; this.ui.onGameViewUpdated(view); }
           else this.net.sendToClient(p.id, 'GAME_VIEW', view);
         }
@@ -2053,10 +2115,25 @@
     const cardPow = (c) => (c.rank !== undefined ? (RANK_POW[c.rank] || 0) : (RENK_VAL_ORDER[c.value] || Number(c.value) || 0));
     const cardGroup = (c) => (SUIT_ORDER[c.suit !== undefined ? c.suit : c.color] ?? 9);
 
+    // Koltuk altındaki bilgi satırı: her oyunda anlamlı olan değer gösterilir (eskiden her oyunda "Skor" yazıyordu).
+    function seatSubText(view, p) {
+      const kart = `${p.cardCount} Kart`;
+      switch (view.gameId) {
+        case 'pisti': return `${kart} | Puan: ${p.score}`;
+        case 'hearts': return view.phase === 'PASSING' ? (p.passed ? '✅ Hazır' : '⏳ Seçiyor...') : `${kart} | Ceza: ${p.score}`;
+        case 'batak': {
+          if (view.phase !== 'PLAYING') { const b = (view.bids || {})[p.id]; return `Teklif: ${b === undefined ? '—' : b === 'PASS' ? 'Pas' : b}`; }
+          return `${kart} | El: ${p.score}${view.highestBidderId === p.id ? ` / ${view.highestBid} 👑` : ''}`;
+        }
+        case 'papaz': return p.cardCount === 0 ? '✅ Kurtuldu' : kart;
+        default: return kart;
+      }
+    }
+
     class UIManager {
       constructor(handlers) {
         this.handlers = handlers;
-        this.selectedAvatar = '🦅'; this.sortMode = 'suit'; this.pendingWildCardId = null;
+        this.selectedAvatar = '🦅'; this.sortMode = 'suit'; this.pendingWildCardId = null; this.passSel = new Set();
         this.lastSeq = -1; this.lastEv = -1; this.wasMyTurn = false; this.overShown = false; this.lastLobby = null;
         this._bindStaticEvents(); this.renderCatalogGrid(); this.renderRulesModalTabs('pisti');
       }
@@ -2148,6 +2225,7 @@
           const av = document.createElement('div'); av.className = 'seat-avatar'; av.textContent = p.avatar;
           const nameEl = document.createElement('strong'); nameEl.textContent = p.name;
           left.append(av, nameEl);
+          if (p.wins > 0) { const w = document.createElement('span'); w.className = 'status-tag'; w.textContent = `🏆 ${p.wins}`; w.title = 'Bu odadaki galibiyet sayısı'; left.appendChild(w); }
           const right = document.createElement('div');
           if (p.isHost) { const tag = document.createElement('span'); tag.className = 'status-tag'; tag.textContent = '👑 Kurucu'; right.appendChild(tag); }
           else if (isHost) {
@@ -2191,6 +2269,10 @@
         const isMyTurn = view.turnPlayerId === localPlayerId;
         document.getElementById('hudTurnBanner').textContent = isMyTurn ? `🔔 SIRA SİZDE! ${view.lastEvent?.text || ''}` : `Sıra: ${turnPlayer ? turnPlayer.name : '-'} — ${view.lastEvent?.text || ''}`;
 
+        if (view.gameId === 'hearts' && view.phase === 'PASSING' && !view.over) {
+          document.getElementById('hudTurnBanner').textContent = view.passDone ? '✅ Kartlarınızı pasladınız. Diğer oyuncular bekleniyor...' : '🔔 Solunuzdaki oyuncuya vereceğiniz 3 kartı seçip "Pasla"ya basın.';
+        }
+
         if (this.pendingWildCardId && (!isMyTurn || !(view.myHand || []).some((c) => c.id === this.pendingWildCardId))) this.pendingWildCardId = null;
 
         // DÜZELTME: aynı olay RESOLVE sonrasında yeniden geldiğinde Pişti efekti/sesi iki kez çalıyordu; artık olay başına bir kez.
@@ -2206,9 +2288,12 @@
         const myTurnNow = isMyTurn && !view.over && !view.resolving;
         if (fresh) { if (myTurnNow && !this.wasMyTurn) audio.playTurnBell(); this.wasMyTurn = myTurnNow; }
 
+        if (!(view.gameId === 'hearts' && view.phase === 'PASSING' && !view.passDone && !view.over)) this.passSel.clear();
+        this._animatePile = freshEvent && ['PLAY', 'PISTI', 'DOUBLE_PISTI', 'CAPTURE'].includes(view.lastEvent?.type);
         this._renderOpponents(view, localPlayerId);
         this._renderCenterPile(view, localPlayerId);
         this._renderLocalPlayer(view, localPlayerId);
+        this._animatePile = false;
 
         if (view.over && view.scoreboard) {
           if (!this.overShown) { this.overShown = true; audio.playWin(); if (window.confetti) { try { window.confetti({ particleCount: 100, spread: 75, origin: { y: 0.6 } }); } catch (_) {} } }
@@ -2232,7 +2317,7 @@
           const av = document.createElement('span'); av.textContent = opp.avatar;
           const info = document.createElement('div'); info.className = 'seat-meta';
           const nm = document.createElement('strong'); nm.textContent = opp.name;
-          const sub = document.createElement('span'); sub.className = 'seat-sub'; sub.textContent = `${opp.cardCount} Kart | Skor: ${opp.score}`;
+          const sub = document.createElement('span'); sub.className = 'seat-sub'; sub.textContent = seatSubText(view, opp);
           info.append(nm, sub);
           const anchor = document.createElement('div'); anchor.className = 'emoji-anchor'; anchor.dataset.emojiFor = opp.id;
           badge.append(av, info, anchor);
@@ -2278,6 +2363,7 @@
           const wrap = document.createElement('div'); wrap.className = 'pile-card-wrap';
           wrap.style.transform = `translate(${(idx - (pile.length - 1) / 2) * 16}px, ${(idx % 3) * 4}px) rotate(${((idx * 7) % 16) - 8}deg)`;
           wrap.innerHTML = card.hidden ? renderCardBackSVG() : renderStandardCardSVG(card);
+          if (this._animatePile && idx === pile.length - 1) wrap.classList.add('drop-in');
           centerZone.appendChild(wrap);
         });
 
@@ -2331,7 +2417,7 @@
         document.getElementById('seatBottom').classList.toggle('active-turn', view.turnPlayerId === localPlayerId);
         document.getElementById('localAvatarRing').textContent = me.avatar;
         document.getElementById('localPlayerNameLabel').textContent = me.name;
-        document.getElementById('localScoreSub').textContent = `${me.cardCount} Kart | Skor: ${me.score}`;
+        document.getElementById('localScoreSub').textContent = seatSubText(view, me);
         document.getElementById('emojiAnchorBottom').dataset.emojiFor = localPlayerId;
 
         const btnPrimary = document.getElementById('btnActionPrimary'), btnSecondary = document.getElementById('btnActionSecondary');
@@ -2343,6 +2429,16 @@
           btnPrimary.hidden = false; btnPrimary.textContent = '📥 Desteden Kart Çek'; btnPrimary.onclick = () => this.handlers.onPlayMove({ type: 'DRAW_CARD' });
         } else if (view.gameId === 'blof' && lm.some((m) => m.type === 'ACCEPT')) {
           btnPrimary.hidden = false; btnPrimary.textContent = '✅ İnandım (Kabul Et)'; btnPrimary.onclick = () => this.handlers.onPlayMove({ type: 'ACCEPT' });
+        }
+        const heartsPassing = view.gameId === 'hearts' && view.phase === 'PASSING' && !view.passDone && !view.over;
+        if (heartsPassing) {
+          for (const id of [...this.passSel]) if (!(view.myHand || []).some((c) => c.id === id)) this.passSel.delete(id);
+          btnPrimary.hidden = false; btnPrimary.textContent = `🤝 Seçilenleri Pasla (${this.passSel.size}/3)`;
+          btnPrimary.onclick = () => {
+            if (this.passSel.size !== 3) { audio.playError(); this.showToast('Paslamak için tam 3 kart seçin.', 'error'); return; }
+            const ids = [...this.passSel]; this.passSel.clear();
+            this.handlers.onPlayMove({ type: 'PASS_CARDS', cardIds: ids });
+          };
         }
         if (view.gameId === 'blof' && view.canCallBluff) {
           btnSecondary.hidden = false; btnSecondary.textContent = '🚨 BLÖF AÇ!'; btnSecondary.onclick = () => this.handlers.onPlayMove({ type: 'CALL_BLUFF' });
@@ -2362,7 +2458,7 @@
         hand.forEach((card, i) => {
           const el = document.createElement('div');
           const playable = legalCardIds.has(card.id) || isSavas;
-          el.className = `playing-card ${neutral ? 'neutral' : playable ? 'playable' : 'unplayable'}`;
+          el.className = `playing-card ${neutral ? 'neutral' : playable ? 'playable' : 'unplayable'}${heartsPassing && this.passSel.has(card.id) ? ' selected-card' : ''}`;
           const mid = (total - 1) / 2;
           const angle = total > 1 ? (i - mid) * Math.min(4.2, 26 / total) : 0;
           el.style.transform = `translateY(${Math.abs(i - mid) * 2}px) rotate(${angle}deg)`;
@@ -2372,7 +2468,13 @@
             if (neutral) { this.showToast('Komşunuzun kapalı kartlarından birine tıklayın.', 'info'); return; }
             if (!playable) { audio.playError(); this.showToast('Bu kart şu an oynanamaz veya sıra sizde değil.', 'error'); return; }
             if (isSavas) { this.handlers.onPlayMove({ type: 'FLIP_CARD' }); return; }
-            if (view.gameId === 'hearts' && view.phase === 'PASSING') { this.handlers.onPlayMove({ type: 'PASS_CARD', cardId: card.id }); return; }
+            if (heartsPassing) {
+              // Seçim yereldir: karta tekrar dokunarak vazgeçilebilir; 3 kart seçilince "Pasla" düğmesiyle gönderilir.
+              if (this.passSel.has(card.id)) this.passSel.delete(card.id);
+              else if (this.passSel.size >= 3) { audio.playError(); this.showToast('En fazla 3 kart seçebilirsiniz. Değiştirmek için seçili karta dokunun.', 'info'); return; }
+              else this.passSel.add(card.id);
+              audio.playClick(); this._renderLocalPlayer(view, localPlayerId); return;
+            }
             if (view.gameId === 'renk' && card.color === 'W') { this.pendingWildCardId = card.id; this._renderCenterPile(view, localPlayerId); return; }
             this.handlers.onPlayMove({ type: 'PLAY_CARD', cardId: card.id });
           });
@@ -2410,7 +2512,11 @@
         body.innerHTML = '';
         const winner = view.scoreboard[0];
         const h3 = document.createElement('h3'); h3.style.color = 'var(--gold-bright)'; h3.style.marginBottom = '10px';
-        h3.textContent = `🥇 Kazanan: ${winner ? winner.name : '-'} (${gameName})`;
+        // DÜZELTME: Papaz'da "kazanan" yoktur, kaybeden vardır; berabere bitişlerde de tek kişi kazanan gösteriliyordu.
+        const sb = view.scoreboard, tops = sb.filter((r) => winner && r.total === winner.total);
+        if (view.gameId === 'papaz') { const loser = sb[sb.length - 1]; h3.textContent = `💀 Papaz kimde? ${loser ? loser.name : '-'} — elinde kaldı!`; }
+        else if (tops.length > 1) h3.textContent = `🤝 Berabere: ${tops.map((r) => r.name).join(', ')} (${gameName})`;
+        else h3.textContent = `🥇 Kazanan: ${winner ? winner.name : '-'} (${gameName})`;
         body.appendChild(h3);
 
         const table = document.createElement('table'); table.className = 'score-table';
@@ -2428,6 +2534,12 @@
           tbody.appendChild(tr);
         });
         table.appendChild(tbody); body.appendChild(table);
+        const sw = (view.sessionWins || []).filter((x) => x.wins > 0).sort((a, b) => b.wins - a.wins);
+        if (sw.length) {
+          const pEl = document.createElement('p'); pEl.style.marginTop = '12px'; pEl.style.fontSize = '0.82rem'; pEl.style.color = 'var(--text-muted)';
+          pEl.textContent = `🏆 Bu odadaki galibiyetler: ${sw.map((x) => `${x.avatar} ${x.name} ${x.wins}`).join('  •  ')}`;
+          body.appendChild(pEl);
+        }
       }
 
       renderRulesModalTabs(activeTab = 'pisti') {
@@ -2438,10 +2550,10 @@
           pisti: ['52 kartlık deste. Ortaya 3 kapalı, 1 açık kart konur (açık kart Vale olamaz).', 'Her oyuncuya 4\'er kart dağıtılır; eller bitince yeniden 4\'er kart dağıtılır.', 'Üstteki kartla aynı değerde kart veya Vale (J) atan tüm yığını toplar.', 'Tek karta eşleşme = Pişti (+10), tek Vale üzerine Vale = Çifte Pişti (+20).', 'Puanlar: ♣2 = 2p, ♦10 = 3p, As ve Vale = 1p, kart fazlası = 3p. Masada kalan kartlar son toplayana gider.'],
           papaz: ['52 karttan 3 Papaz (♠K, ♦K, ♣K) çıkarılır; geriye ♥K kalır (49 kart).', 'Başta herkes elindeki çiftleri atar.', 'Sırası gelen, komşusunun kapalı kartlarından birine tıklayarak çeker. Sonda ♥K elinde kalan kaybeder.'],
           batak: ['4 kişiyle oynanır. İhale 5\'ten başlar; herkes pas geçerse ihale 5 ile son oyuncuya kalır.', 'İhaleyi alan koz seçer ve ilk eli açar. Renge uyma, renk yoksa koz atma ve büyütme zorunludur (el kozla kesildiyse renge uyarken büyütmek gerekmez).', 'İhaleci teklifini tutturursa aldığı el × 10 puan, tutturamazsa −(teklif × 10) puan alır.'],
-          hearts: ['Başta herkes solundaki oyuncuya 3 kart paslar; ♣2 ile oyun başlar.', 'Her Kupa 1, Maça Kızı (♠Q) 13 ceza puanıdır. 26 cezanın tamamını toplayan "Ay\'ı Vurur" (kendisi 0, rakipler 26).', 'İlk elde ceza kartı atılamaz (başka kartın varsa). Kupa kırılmadan Kupa ile el açılamaz.'],
+          hearts: ['Başta herkes aynı anda 3 kart seçip "Pasla"ya basar; kartlar soldaki oyuncuya gider. ♣2 ile oyun başlar.', 'Her Kupa 1, Maça Kızı (♠Q) 13 ceza puanıdır. 26 cezanın tamamını toplayan "Ay\'ı Vurur" (kendisi 0, rakipler 26).', 'İlk elde ceza kartı atılamaz (başka kartın varsa). Kupa kırılmadan Kupa ile el açılamaz.'],
           blof: ['Sırayla A, 2, 3 … K beyan edilerek kapalı kart atılır.', 'İnanmayan "BLÖF AÇ!" der. Yalan çıkmışsa atan, doğru çıkmışsa itiraz eden yerdeki kartları alır.', 'Eli ilk biten kazanır. Son kartı atanın ardından sıradaki oyuncu "İnandım" derse oyun biter.'],
           renk: ['4 renkli özel deste (108 kart): üstteki kartla aynı renk veya aynı sembol oynanır.', 'Pas, Yön Değiştir, +2, Joker ve +4 kartları vardır. Kart çekersen sıra bir sonraki oyuncuya geçer. Elinde tek kart kalan için "SON KART!" duyurulur.', 'Eli ilk biten kazanır.'],
-          savas: ['2 kişilik düello: 26\'şar kart dağıtılır, büyük kart ikisini de alır.', 'Eşitlikte SAVAŞ: 3 kapalı + 1 açık kart konur, kazanan tüm potu toplar.', '60 turda bitmezse çok kartı olan kazanır.'],
+          savas: ['2 kişilik düello: 26\'şar kart dağıtılır; iki oyuncu da kartını açar (sıra beklenmez), büyük kart ikisini de alır.', 'Eşitlikte SAVAŞ: 3 kapalı + 1 açık kart konur, kazanan tüm potu toplar.', '60 turda bitmezse çok kartı olan kazanır.'],
           online: ['1. "👑 Oda Kur" ile oda açın; 5 haneli kodu veya "🔗 Davet Linki"ni arkadaşlarınıza gönderin.', '2. Arkadaşlarınız linke tıklayıp adını girerek "Odaya Katıl"a basar.', '3. Kurucu oyunu seçip "▶ Masayı Başlat"a basar. Kurucu sekmesini kapatırsa oda kapanır.', '4. Bağlantısı kopan oyuncuya 15 sn süre verilir; dönmezse yerine bot geçer, geri dönerse yerini geri alır.', '5. GitHub Pages: "📦 GitHub ZIP" ile dosyayı indirip bir repoya yükleyin, Settings > Pages > main / root.', '6. Not: Çok katı güvenlik duvarı/CGNAT ağlarda kendi TURN sunucunuzu window.KVIP_ICE_SERVERS ile tanımlayın.']
         };
         tabs.forEach((t) => {
@@ -2663,27 +2775,68 @@ Adresin sonuna \`?test=1\` ekleyin: 7 oyun x 200 bot oyunu simüle edilir.
         resizeTimer = setTimeout(() => { if (engine.lastView && !document.getElementById('screenTable').hidden) ui.renderGameView(engine.lastView, net.localPlayerId); }, 150);
       });
 
-      window.addEventListener('beforeunload', () => { if (net.joined && !net.isHost) net.sendToHost('LEAVE', {}); });
+      const hostingOthers = () => engine.isHost && net.peer && net.roomCode && net.roomCode !== 'SOLO' && engine.players.some((p) => !p.isBot && p.id !== net.localPlayerId);
+      window.addEventListener('beforeunload', (e) => {
+        if (net.joined && !net.isHost) { net.sendToHost('LEAVE', {}); return; }
+        // Kurucu sekmeyi yanlışlıkla kapatırsa oda herkes için kapanır: tarayıcı onay sorar.
+        if (hostingOthers()) { e.preventDefault(); e.returnValue = ''; }
+      });
+
+      // Oyun masasındayken ekranın kararmasını/kilitlenmesini engelle (destekleyen tarayıcılarda). Özellikle kurucunun telefonu için önemli.
+      let wakeLock = null;
+      const syncWakeLock = async () => {
+        const want = !document.getElementById('screenTable').hidden && document.visibilityState === 'visible';
+        try {
+          if (want && !wakeLock && navigator.wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+          else if (!want && wakeLock) { const w = wakeLock; wakeLock = null; await w.release(); }
+        } catch (_) { wakeLock = null; }
+      };
+      document.addEventListener('visibilitychange', syncWakeLock);
+      const origShow = ui.showScreen.bind(ui);
+      ui.showScreen = (id) => { origShow(id); syncWakeLock(); };
 
       const params = new URLSearchParams(location.search);
       if (params.get('test') === '1') { ui.showScreen('screenSelfTest'); setTimeout(runAutomatedSelfTests, 30); return; }
       const invite = (params.get('oda') || '').toUpperCase().slice(0, 5);
       let lastRoom = null;
       try { lastRoom = sessionStorage.getItem('kvip_last_room'); } catch (_) {}
+      // DÜZELTME: Sekme "çoğaltılırsa" oturum kimliği de kopyalanıyordu; iki sekme aynı koltuk için birbirinin bağlantısını düşürüyordu.
+      // Yeni açılan sekme, aynı kimliği kullanan başka bir sekme olduğunu öğrenirse kendine yeni kimlik üretir.
+      let duplicateTab = false, tabCheckOpen = true, tabChannel = null;
+      try { tabChannel = new BroadcastChannel('kvip_tabs'); } catch (_) {}
+      if (tabChannel) {
+        tabChannel.onmessage = (e) => {
+          const m = e.data;
+          if (!m || typeof m !== 'object') return;
+          if (m.t === 'hello' && m.id === net.localPlayerId) tabChannel.postMessage({ t: 'taken', id: m.id });
+          else if (m.t === 'taken' && m.id === net.localPlayerId && tabCheckOpen) {
+            duplicateTab = true;
+            net.localPlayerId = `p_${randomCode(8)}`; net.localToken = randomCode(16);
+            try { sessionStorage.setItem('kvip_session_player_id', net.localPlayerId); sessionStorage.setItem('kvip_session_token', net.localToken); sessionStorage.removeItem('kvip_last_room'); } catch (_) {}
+          }
+        };
+        tabChannel.postMessage({ t: 'hello', id: net.localPlayerId });
+      }
       if (lastRoom && /^[2-9A-HJ-NP-Z]{5}$/.test(lastRoom) && !invite) {
         // Sayfa yenilendi / kapanıp açıldı: aynı oturum kimliğiyle eski koltuğa geri dön.
-        ui.showToast(`${lastRoom} odasına yeniden bağlanılıyor...`, 'info');
-        busy = true; engine.setClientMode();
-        net.joinRoom(lastRoom, ui.getPlayerProfile())
-          .then(() => ui.showToast('Odaya geri döndünüz!', 'success'))
-          .catch(() => { engine.reset(); try { sessionStorage.removeItem('kvip_last_room'); } catch (_) {} ui.showToast('Önceki oda artık yok.', 'error'); })
-          .finally(() => { busy = false; });
+        busy = true;
+        setTimeout(() => {
+          tabCheckOpen = false;
+          if (duplicateTab) { busy = false; return; }
+          ui.showToast(`${lastRoom} odasına yeniden bağlanılıyor...`, 'info');
+          engine.setClientMode();
+          net.joinRoom(lastRoom, ui.getPlayerProfile())
+            .then(() => ui.showToast('Odaya geri döndünüz!', 'success'))
+            .catch(() => { engine.reset(); try { sessionStorage.removeItem('kvip_last_room'); } catch (_) {} ui.showToast('Önceki oda artık yok.', 'error'); })
+            .finally(() => { busy = false; });
+        }, tabChannel ? 350 : 0);
       } else if (invite) {
+        setTimeout(() => { tabCheckOpen = false; }, 350);
         document.getElementById('inputJoinCode').value = invite;
         ui.showToast(`Davet kodu hazır (${invite}). Adınızı yazıp "Odaya Katıl"a basın!`, 'info');
-      }
+      } else setTimeout(() => { tabCheckOpen = false; }, 350);
     }
     if (document.readyState === 'loading') window.addEventListener('DOMContentLoaded', boot); else boot();
   </script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a5a6c1bdb978b669',t:'MTc5NDY2NzA3NA=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a5a6c1bdb978b669',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
